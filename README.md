@@ -8,10 +8,11 @@
 
 ## Features
 
-- Uses the **middleware CLI `midclt`** – matches how SCALE itself manages storage.
+- Uses the **middleware CLI `midclt`** – matches how SCALE itself manages storage.
 - **Idempotent** – skips datasets that already exist.  
 - **`--dry-run`** – preview JSON payloads & ACL decisions with zero changes.  
 - **`--force‑acl`** – re‑apply ACL & ownership to existing datasets.  
+- **`--encrypt`** – create encrypted datasets (AES-256-GCM) with auto-generated keys.
 - Saves your preferred **pool** and **root dataset** in a dot‑file next to the script.  
 - Easy-to-read logs with clear messages.
 
@@ -48,11 +49,12 @@ sudo ./create_app_dataset.sh portracker config data upload
 
 ## Options
 
-* `-p, --pool <name>` Override ZFS pool (and save it in a dot-file next to the script).
-* `-r, --root <name>` Override parent root dataset (e.g. `apps-config` and save it in a dot-file next to the script).
-* `-f, --force-acl` Re‑apply ACL & ownership even on existing datasets.
-* `--dry-run` Preview everything, change nothing.
-* `-h, --help` Usage message.
+* `-p, --pool <name>` Override ZFS pool (and save it in a dot-file next to the script).
+* `-r, --root <name>` Override parent root dataset (e.g. `apps-config` and save it in a dot-file next to the script).
+* `-f, --force-acl` Re‑apply ACL & ownership even on existing datasets.
+* `-e, --encrypt` Create encrypted datasets (AES-256-GCM, auto-generated key). Child datasets inherit encryption.
+* `--dry-run` Preview everything, change nothing.
+* `-h, --help` Usage message.
 
 ---
 
@@ -76,6 +78,9 @@ sudo ./create_app_dataset.sh -p tank -r appdata portracker
 
 # fix permissions on an existing app tree
 sudo ./create_app_dataset.sh --force-acl portracker config data
+
+# create encrypted app dataset (parent is encryption root, children inherit)
+sudo ./create_app_dataset.sh --encrypt immich config data upload
 
 # add child datasets to an existing app dataset, if you already have portracker created
 # (e.g. portracker/config, portracker/data)

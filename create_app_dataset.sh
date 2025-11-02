@@ -17,6 +17,10 @@
 #   Use `--force-acl` to re-apply ACLs to existing datasets.
 # • `--dry-run` previews JSON payloads without touching your system,
 #   accurately reflecting whether ACLs would be applied or skipped.
+# • Optional `--encrypt` will:
+#   - create the main app dataset as a new ZFS encryption root
+#   - create child datasets inheriting that encryption
+#   - use AES-256-GCM with an auto-generated key stored by TrueNAS for unlock.
 # • Configurable ZFS pool and root dataset via flags **or** a one-time dot-file.
 # • The configuration dot-file (.create_app_dataset.conf) is created/read
 #   in the *same directory* as the script itself.
@@ -32,6 +36,9 @@
 #   -r, --root  <name>    Parent dataset root (e.g. appdata)
 #   -f, --force-acl       Force application of ACLs and ownership,
 #                         even if datasets already exist.
+#   -e, --encrypt         Create <app_name> as a new encrypted dataset
+#                         (AES-256-GCM, auto-generated key). Child datasets
+#                         will inherit encryption.
 #   --dry-run             Show what would happen, make no changes
 #   -h, --help            Print this help and exit
 #
@@ -46,6 +53,22 @@
 #
 # Example (re-applying ACLs to existing datasets):
 #   sudo ./create_app_dataset.sh --force-acl immich config data upload
+#
+# Example (encrypted app tree):
+#   sudo ./create_app_dataset.sh --encrypt immich config data upload
+#   ⇒ Pool/apps-config/immich is an encryption root with its own key,
+#      children inherit that encryption.
+#
+# ENCRYPTION NOTES
+# ----------------
+# • `--encrypt` only applies when creating the <app_name> dataset itself.
+#   - That dataset is created with `"encryption": true` and
+#     `"encryption_options": {"generate_key": true, "algorithm": "AES-256-GCM"}`.
+#   - Children are created with `"inherit_encryption": true`.
+# • If the parent dataset already exists (and maybe is already encrypted),
+#   we will skip creation and therefore skip setting encryption on it again.
+# • If you later add NEW child datasets under an encrypted parent,
+#   you should also pass `--encrypt` so those children get `"inherit_encryption": true`.
 #
 # CONFIG FILE
 # -----------
@@ -95,6 +118,7 @@ CONFIG_FILE="${SCRIPT_DIR}/.create_app_dataset.conf"
 # --- Global Variables ---
 DRY_RUN=false
 FORCE_ACL=false # Flag to control ACL re-application on existing datasets
+ENCRYPT_DATASETS=false  # Flag to enable ZFS encryption on datasets
 CREATED_DATASETS=() # Keep track of datasets created in this run for potential cleanup
 DRY_RUN_WOULD_CREATE_DATASETS=() # Tracks datasets that *would* be created in a dry run
 
@@ -193,10 +217,84 @@ confirm_parent_root_dataset() {
 }
 
 
+#
+# build_create_payload
+# --------------------
+# Generates the JSON payload for `pool.dataset.create` with/without encryption.
+#
+# Args:
+#   $1 = dataset_full_path (e.g. Pool/apps-config/immich[/config])
+#   $2 = is_child ("true"/"false")
+#
+# Behavior:
+#   - If ENCRYPT_DATASETS=false:
+#         normal Apps preset, no encryption fields
+#   - If ENCRYPT_DATASETS=true AND is_child=="false":
+#         create new encryption root with its own key
+#   - If ENCRYPT_DATASETS=true AND is_child=="true":
+#         inherit encryption from parent
+#
+build_create_payload() {
+    local dataset_full_path="$1"
+    local is_child="$2"
+
+    if "${ENCRYPT_DATASETS}"; then
+        if [ "${is_child}" = "false" ]; then
+            # Parent: new encryption root
+            # Note: inherit_encryption must be explicitly false when creating a new encryption root
+            cat <<EOF
+{
+  "name": "${dataset_full_path}",
+  "type": "FILESYSTEM",
+  "share_type": "APPS",
+  "acltype": "NFSV4",
+  "aclmode": "PASSTHROUGH",
+  "inherit_encryption": false,
+  "encryption": true,
+  "encryption_options": {
+    "generate_key": true,
+    "algorithm": "AES-256-GCM"
+  }
+}
+EOF
+        else
+            # Child: inherit encryption
+            cat <<EOF
+{
+  "name": "${dataset_full_path}",
+  "type": "FILESYSTEM",
+  "share_type": "APPS",
+  "acltype": "NFSV4",
+  "aclmode": "PASSTHROUGH",
+  "inherit_encryption": true
+}
+EOF
+        fi
+    else
+        # No encryption
+        cat <<EOF
+{
+  "name": "${dataset_full_path}",
+  "type": "FILESYSTEM",
+  "share_type": "APPS",
+  "acltype": "NFSV4",
+  "aclmode": "PASSTHROUGH"
+}
+EOF
+    fi
+}
+
+
 # Function to create a dataset using TrueNAS middleware.
 # It checks for existence before creation to ensure idempotence.
+#
+# Args:
+#   $1 = dataset_full_path
+#   $2 = is_child ("true"/"false")
+#
 create_dataset() {
   local dataset_full_path="$1"
+  local is_child="$2"
 
   log_info "Checking if dataset ${dataset_full_path} already exists..."
 
@@ -204,7 +302,8 @@ create_dataset() {
     log_success "Dataset ${dataset_full_path} already exists. Skipping creation."
   else
     log_warn "Creating dataset ${dataset_full_path} with Apps preset..."
-    local create_json_payload="{\"name\": \"${dataset_full_path}\", \"type\": \"FILESYSTEM\", \"share_type\": \"APPS\", \"acltype\": \"NFSV4\", \"aclmode\": \"PASSTHROUGH\"}"
+    local create_json_payload
+    create_json_payload="$(build_create_payload "${dataset_full_path}" "${is_child}")"
 
     if ! "${DRY_RUN}"; then
       midclt call pool.dataset.create "${create_json_payload}"
@@ -365,6 +464,7 @@ load_config
 # --- Argument Parsing (Revised as per ChatGPT's suggestion for flexibility) ---
 DRY_RUN=false
 FORCE_ACL=false
+ENCRYPT_DATASETS=false
 # Use temporary variables for pool/root overrides to avoid affecting config load until after parsing.
 # The global POOL_NAME and PARENT_DATASET_ROOT are initially from load_config.
 # These local overrides will take precedence if set by CLI.
@@ -387,6 +487,8 @@ while (($#)); do
       ;;
     -f|--force-acl)
       FORCE_ACL=true; shift ;;
+    -e|--encrypt)
+      ENCRYPT_DATASETS=true; shift ;;
     --dry-run)
       DRY_RUN=true;  shift ;;
     -h|--help)
@@ -484,6 +586,7 @@ fi
 if "${DRY_RUN}"; then
   log_dryrun "--- DRY RUN MODE ENABLED ---"
   log_dryrun "No changes will be made to your TrueNAS system."
+  log_dryrun "Encryption requested? ${ENCRYPT_DATASETS}"
   log_dryrun "---------------------------"
 fi
 
@@ -491,11 +594,12 @@ fi
 BASE_PATH="${POOL_NAME}/${PARENT_DATASET_ROOT}/${PARENT_APP_NAME}"
 
 # 1) Create Parent Dataset (e.g., Pool/apps-config/parent)
-create_dataset "${BASE_PATH}"
+#    is_child = "false" (this is where we may start a new encryption root if --encrypt)
+create_dataset "${BASE_PATH}" "false"
 
 # 2) Create Any Child Datasets
 for child in "${CHILD_DATASET_NAMES[@]}"; do
-  create_dataset "${BASE_PATH}/${child}"
+  create_dataset "${BASE_PATH}/${child}" "true"
 done
 
 # 3) Apply ACL to Parent Dataset (conditionally)
@@ -518,6 +622,7 @@ echo "Parent dataset   : /mnt/${BASE_PATH}"
 if [ ${#CHILD_DATASET_NAMES[@]} -gt 0 ]; then
   echo "Child datasets   : $(IFS=', '; echo "${CHILD_DATASET_NAMES[*]}")"
 fi
+echo "Encrypted root?  : ${ENCRYPT_DATASETS}"
 echo "Ownership        : ${APPS_USER}:${APPS_GROUP}"
 echo "(Tip: save defaults in ${CONFIG_FILE} or use -p/-r flags to configure.)"
 
